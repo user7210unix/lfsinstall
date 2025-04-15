@@ -20,16 +20,23 @@ LFS_PART=""
 EFI_PART=""
 SWAP_PART=""
 DISK=""
-SWAP_SIZE=2048  # in MB
-MIN_DISK_SIZE=25  # in GB
+SWAP_SIZE=2048  # in MiB
+MIN_DISK_SIZE=25  # in GiB
 USE_MUSL="no"
 USE_BUSYBOX="no"
 INSTALL_X11="no"
 
+# ANSI color codes
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+RESET='\033[0m'
+
 # URLs for additional packages
 MUSL_URL="https://musl.libc.org/releases/musl-1.2.5.tar.gz"
 BUSYBOX_URL="https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
-# BLFS X11 dependencies
 XORG_PROTO_URL="https://www.x.org/pub/individual/proto/xorgproto-2024.1.tar.xz"
 LIBXAU_URL="https://www.x.org/pub/individual/lib/libXau-1.0.11.tar.xz"
 LIBXDMCP_URL="https://www.x.org/pub/individual/lib/libXdmcp-1.1.5.tar.xz"
@@ -48,33 +55,36 @@ XTERM_URL="https://invisible-mirror.net/archives/xterm/xterm-392.tgz"
 PATCH_URL="https://www.linuxfromscratch.org/patches/blfs/svn/xorg-server-21.1.16-tearfree_backport-1.patch"
 FONT_UTIL_URL="https://www.x.org/pub/individual/font/font-util-1.4.1.tar.xz"
 
-# Function to display messages
+# Function to display colored messages
 message() {
-    printf "%s\n" "$1"
+    color="$1"
+    msg="$2"
+    printf "%b%s%b\n" "$color" "$msg" "$RESET"
 }
 
 # Function to check root privileges
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        message "Error: This script must be run as root!"
+        message "$RED" "Error: This script must be run as root!"
         exit 1
     fi
 }
 
 # Function to check host tools
 check_host_tools() {
-    for tool in wget parted mkfs.ext4 mkfs.vfat mkswap swapon; do
+    message "$BLUE" "Checking for required host tools..."
+    for tool in wget parted mkfs.ext4 mkfs.vfat mkswap swapon meson ninja; do
         if ! command -v "$tool" >/dev/null 2>&1; then
-            message "Error: Required tool $tool is missing. Please install it."
+            message "$RED" "Error: Required tool $tool is missing. Please install it."
             exit 1
         fi
     done
-    message "All required host tools are present."
+    message "$GREEN" "All required host tools are present."
 }
 
 # Function to prompt user with yes/no
 prompt_yes_no() {
-    message "$1 [y/N]: "
+    message "$CYAN" "$1 [y/N]: "
     read answer
     case "$answer" in
         [Yy]*) return 0 ;;
@@ -82,22 +92,28 @@ prompt_yes_no() {
     esac
 }
 
+# Function to reduce input delay
+setup_terminal() {
+    # Disable line buffering to reduce input delay
+    stty -icanon min 1
+}
+
 # Function to detect UEFI
 check_uefi() {
     if [ -d /sys/firmware/efi ]; then
         BOOT_MODE="UEFI"
-        message "Detected UEFI boot mode."
+        message "$GREEN" "Detected UEFI boot mode."
     else
-        message "Configuring for BIOS boot."
+        message "$GREEN" "Configuring for BIOS boot."
     fi
 }
 
 # Function to select and partition disk
 partition_disk() {
-    message "Available disks:"
+    message "$BLUE" "Available disks:"
     disks=$(lsblk -d -o NAME,TYPE | grep disk | awk '{print $1}')
     if [ -z "$disks" ]; then
-        message "Error: No disks found!"
+        message "$RED" "Error: No disks found!"
         exit 1
     fi
     i=1
@@ -106,26 +122,26 @@ partition_disk() {
         eval "disk_$i=$disk"
         i=$((i + 1))
     done
-    message "Select disk number (1-$((i - 1))): "
+    message "$CYAN" "Select disk number (1-$((i - 1))): "
     read choice
     if ! echo "$choice" | grep -q '^[0-9]$' || [ "$choice" -lt 1 ] || [ "$choice" -ge "$i" ]; then
-        message "Error: Invalid selection!"
+        message "$RED" "Error: Invalid selection!"
         exit 1
     fi
     eval "DISK=/dev/\$disk_$choice"
-    message "Selected disk: $DISK"
+    message "$GREEN" "Selected disk: $DISK"
 
-    message "This will erase all data on $DISK. Proceed? [y/N]: "
+    message "$YELLOW" "This will erase all data on $DISK. Proceed? [y/N]: "
     read confirm
     case "$confirm" in
         [Yy]*) ;;
-        *) message "Partitioning canceled."; exit 1 ;;
+        *) message "$RED" "Partitioning canceled."; exit 1 ;;
     esac
 
     disk_size=$(blockdev --getsize64 "$DISK")
     disk_size_gb=$((disk_size / 1024 / 1024 / 1024))
     if [ "$disk_size_gb" -lt "$MIN_DISK_SIZE" ]; then
-        message "Warning: Disk size ($disk_size_gb GB) is less than $MIN_DISK_SIZE GB."
+        message "$YELLOW" "Warning: Disk size ($disk_size_gb GiB) is less than $MIN_DISK_SIZE GiB."
         if ! prompt_yes_no "Proceed anyway?"; then
             exit 1
         fi
@@ -136,23 +152,24 @@ partition_disk() {
         *) PART_SUFFIX="" ;;
     esac
 
+    # Ensure proper alignment by starting at 1 MiB and using MiB units
     if [ "$BOOT_MODE" = "UEFI" ]; then
         parted -s "$DISK" mklabel gpt
-        parted -s "$DISK" mkpart ESP fat32 0% 512MiB
+        parted -s "$DISK" mkpart ESP fat32 1MiB 513MiB
         parted -s "$DISK" set 1 esp on
-        parted -s "$DISK" mkpart primary linux-swap -${SWAP_SIZE}MiB 100%
-        parted -s "$DISK" mkpart primary ext4 512MiB -${SWAP_SIZE}MiB
+        parted -s "$DISK" mkpart primary ext4 513MiB $((513 + SWAP_SIZE))MiB
+        parted -s "$DISK" mkpart primary linux-swap $((513 + SWAP_SIZE))MiB 100%
         EFI_PART="${DISK}${PART_SUFFIX}1"
-        LFS_PART="${DISK}${PART_SUFFIX}3"
         SWAP_PART="${DISK}${PART_SUFFIX}2"
+        LFS_PART="${DISK}${PART_SUFFIX}3"
     else
         parted -s "$DISK" mklabel gpt
-        parted -s "$DISK" mkpart primary 0% 1MiB
+        parted -s "$DISK" mkpart primary 1MiB 2MiB
         parted -s "$DISK" set 1 bios_grub on
-        parted -s "$DISK" mkpart primary linux-swap -${SWAP_SIZE}MiB 100%
-        parted -s "$DISK" mkpart primary ext4 1MiB -${SWAP_SIZE}MiB
-        LFS_PART="${DISK}${PART_SUFFIX}3"
+        parted -s "$DISK" mkpart primary ext4 2MiB $((2 + SWAP_SIZE))MiB
+        parted -s "$DISK" mkpart primary linux-swap $((2 + SWAP_SIZE))MiB 100%
         SWAP_PART="${DISK}${PART_SUFFIX}2"
+        LFS_PART="${DISK}${PART_SUFFIX}3"
     fi
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
@@ -168,60 +185,61 @@ partition_disk() {
         mount "$EFI_PART" "$LFS_MOUNT/boot/efi"
     fi
     swapon "$SWAP_PART"
-    message "Partitioning and mounting completed."
+    message "$GREEN" "Partitioning and mounting completed."
 }
 
 # Function to prompt user options
 prompt_options() {
-    message "Enter hostname (default: lfs): "
+    message "$BLUE" "=== LFS Installation Configuration ==="
+    message "$CYAN" "Enter hostname (default: lfs): "
     read hostname_input
     HOSTNAME="${hostname_input:-lfs}"
 
-    message "Enter username for LFS user: "
+    message "$CYAN" "Enter username for LFS user: "
     read USERNAME
     while [ -z "$USERNAME" ]; do
-        message "Error: Username cannot be empty!"
-        message "Enter username for LFS user: "
+        message "$RED" "Error: Username cannot be empty!"
+        message "$CYAN" "Enter username for LFS user: "
         read USERNAME
     done
 
-    message "Enter root password: "
+    message "$CYAN" "Enter root password: "
     read -r ROOT_PASS
     while [ -z "$ROOT_PASS" ]; do
-        message "Error: Root password cannot be empty!"
-        message "Enter root password: "
+        message "$RED" "Error: Root password cannot be empty!"
+        message "$CYAN" "Enter root password: "
         read -r ROOT_PASS
     done
 
-    message "Enter password for user $USERNAME: "
+    message "$CYAN" "Enter password for user $USERNAME: "
     read -r USER_PASS
     while [ -z "$USER_PASS" ]; do
-        message "Error: User password cannot be empty!"
-        message "Enter password for user $USERNAME: "
+        message "$RED" "Error: User password cannot be empty!"
+        message "$CYAN" "Enter password for user $USERNAME: "
         read -r USER_PASS
     done
 
-    message "Select libc implementation:"
-    message "1) glibc"
-    message "2) musl"
-    message "Enter choice [1]: "
+    message "$BLUE" "Select libc implementation:"
+    message "$CYAN" "1) glibc"
+    message "$CYAN" "2) musl"
+    message "$CYAN" "Enter choice [1]: "
     read libc_choice
     case "$libc_choice" in
         2) USE_MUSL="yes" ;;
         ""|1|*) USE_MUSL="no" ;;
     esac
 
-    message "Select utilities:"
-    message "1) coreutils"
-    message "2) busybox"
-    message "Enter choice [1]: "
+    message "$BLUE" "Select utilities:"
+    message "$CYAN" "1) coreutils"
+    message "$CYAN" "2) busybox"
+    message "$CYAN" "Enter choice [1]: "
     read utils_choice
     case "$utils_choice" in
         2) USE_BUSYBOX="yes" ;;
         ""|1|*) USE_BUSYBOX="no" ;;
     esac
 
-    message "Install basic X11 environment with fluxbox and xterm? [y/N]: "
+    message вит"$BLUE" "Install basic X11 environment with fluxbox and xterm? [y/N]: "
     read x11_choice
     case "$x11_choice" in
         [Yy]*) INSTALL_X11="yes" ;;
@@ -231,31 +249,31 @@ prompt_options() {
 
 # Function to download packages
 download_packages() {
-    message "Downloading LFS and BLFS packages..."
+    message "$BLUE" "Downloading LFS and BLFS packages..."
     mkdir -p "$LFS_SOURCES"
     chmod a+wt "$LFS_SOURCES"
-    wget -i "$WGET_LIST" -P "$LFS_SOURCES" || message "Warning: Some LFS downloads may have failed."
+    wget -i "$WGET_LIST" -P "$LFS_SOURCES" || message "$YELLOW" "Warning: Some LFS downloads may have failed."
     if [ "$USE_MUSL" = "yes" ]; then
-        wget -P "$LFS_SOURCES" "$MUSL_URL" || message "Warning: Failed to download musl."
+        wget -P "$LFS_SOURCES" "$MUSL_URL" || message "$YELLOW" "Warning: Failed to download musl."
     fi
     if [ "$USE_BUSYBOX" = "yes" ]; then
-        wget -P "$LFS_SOURCES" "$BUSYBOX_URL" || message "Warning: Failed to download busybox."
+        wget -P "$LFS_SOURCES" "$BUSYBOX_URL" || message "$YELLOW" "Warning: Failed to download busybox."
     fi
     if [ "$INSTALL_X11" = "yes" ]; then
         for url in "$XORG_PROTO_URL" "$LIBXAU_URL" "$LIBXDMCP_URL" "$LIBX11_URL" "$LIBXEXT_URL" "$LIBXRENDER_URL" "$LIBXCB_URL" "$XCB_PROTO_URL" "$XORG_SERVER_URL" "$LIBXCVT_URL" "$PIXMAN_URL" "$XKEYBOARD_CONFIG_URL" "$XINIT_URL" "$FLUXBOX_URL" "$XTERM_URL" "$PATCH_URL" "$FONT_UTIL_URL"; do
-            wget -P "$LFS_SOURCES" "$url" || message "Warning: Failed to download $url."
+            wget -P "$LFS_SOURCES" "$url" || message "$YELLOW" "Warning: Failed to download $url."
         done
     fi
     pushd "$LFS_SOURCES"
     wget -q -O md5sums "$MD5SUMS"
-    md5sum -c md5sums || message "Warning: Some packages may not match MD5 sums."
+    md5sum -c md5sums || message "$YELLOW" "Warning: Some packages may not match MD5 sums."
     popd
-    message "Package downloads completed."
+    message "$GREEN" "Package downloads completed."
 }
 
 # Function to setup LFS environment
 setup_lfs_environment() {
-    message "Setting up LFS environment..."
+    message "$BLUE" "Setting up LFS environment..."
     mkdir -pv "$LFS_MOUNT"/{etc,var,usr/{bin,lib,sbin},tools}
     for i in bin lib sbin; do ln -sv usr/$i "$LFS_MOUNT/$i"; done
     [ "$(uname -m)" = "x86_64" ] && mkdir -pv "$LFS_MOUNT/lib64"
@@ -277,12 +295,12 @@ export LFS LC_ALL LFS_TGT PATH CONFIG_SITE
 EOF
     chown lfs:lfs /home/lfs/{.bash_profile,.bashrc}
     chown -v lfs "$LFS_MOUNT"/{tools,sources}
-    message "LFS environment setup completed."
+    message "$GREEN" "LFS environment setup completed."
 }
 
 # Function to build temporary toolchain
 build_toolchain() {
-    message "Building temporary toolchain..."
+    message "$BLUE" "Building temporary toolchain..."
     su - lfs -c "
         set -e
         cd $LFS_SOURCES
@@ -338,24 +356,24 @@ build_toolchain() {
         cd $LFS_SOURCES
         rm -rf gcc-*
     "
-    message "Temporary toolchain built successfully."
+    message "$GREEN" "Temporary toolchain built successfully."
 }
 
 # Function to mount virtual filesystems
 mount_virtual_fs() {
-    message "Mounting virtual filesystems..."
+    message "$BLUE" "Mounting virtual filesystems..."
     mkdir -pv "$LFS_MOUNT"/{dev,proc,sys,run}
     mount -v --bind /dev "$LFS_MOUNT/dev"
     mount -v --bind /dev/pts "$LFS_MOUNT/dev/pts"
     mount -vt proc proc "$LFS_MOUNT/proc"
     mount -vt sysfs sysfs "$LFS_MOUNT/sys"
     mount -vt tmpfs tmpfs "$LFS_MOUNT/run"
-    message "Virtual filesystems mounted."
+    message "$GREEN" "Virtual filesystems mounted."
 }
 
 # Function to build temporary tools
 build_temporary_tools() {
-    message "Building temporary tools..."
+    message "$BLUE" "Building temporary tools..."
     su - lfs -c "
         set -e
         cd $LFS_SOURCES
@@ -383,7 +401,6 @@ build_temporary_tools() {
             cd $LFS_SOURCES
             rm -rf coreutils-*
         fi
-        # Additional tools for a complete toolchain
         tar -xf m4-*.tar.*
         cd m4-*
         ./configure --prefix=/tools --host=$LFS_TGT
@@ -399,12 +416,12 @@ build_temporary_tools() {
         cd $LFS_SOURCES
         rm -rf ncurses-*
     "
-    message "Temporary tools built successfully."
+    message "$GREEN" "Temporary tools built successfully."
 }
 
 # Function to install X11 environment (BLFS)
 install_x11() {
-    message "Installing basic X11 environment..."
+    message "$BLUE" "Installing basic X11 environment..."
     chroot "$LFS_MOUNT" /tools/bin/env -i HOME=/root TERM="$TERM" PS1='(lfs chroot) \u:\w\$ ' PATH=/bin:/usr/bin:/sbin:/usr/sbin:/tools/bin /tools/bin/bash --login +h -c "
         set -e
         cd /sources
@@ -424,74 +441,70 @@ install_x11() {
         cd /sources
         rm -rf libXau-*
         tar -xf libXdmcp-*.tar.*
-        cd libXdmcp-*
-        ./configure --prefix=/usr
-        make
-        make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libXdmcp-*
         tar -xf xcb-proto-*.tar.*
         cd xcb-proto-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf xcb-proto-*
         tar -xf libxcb-*.tar.*
         cd libxcb-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libxcb-*
         tar -xf libX11-*.tar.*
         cd libX11-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libX11-*
         tar -xf libXext-*.tar.*
         cd libXext-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libXext-*
         tar -xf libXrender-*.tar.*
         cd libXrender-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libXrender-*
         tar -xf libxcvt-*.tar.*
         cd libxcvt-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf libxcvt-*
         tar -xf pixman-*.tar.*
         cd pixman-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf pixman-*
         tar -xf font-util-*.tar.*
         cd font-util-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf font-util-*
         tar -xf xkeyboard-config-*.tar.*
         cd xkeyboard-config-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf xkeyboard-config-*
         tar -xf xorg-server-*.tar.*
         cd xorg-server-*
@@ -500,28 +513,28 @@ install_x11() {
         meson setup .. --prefix=/usr --localstatedir=/var -D glamor=true -D systemd_logind=false
         ninja
         ninja install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf xorg-server-*
         tar -xf xinit-*.tar.*
         cd xinit-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf xinit-*
         tar -xf fluxbox-*.tar.*
         cd fluxbox-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf fluxbox-*
         tar -xf xterm-*.tar.*
         cd xterm-*
         ./configure --prefix=/usr
         make
         make install
-        cd /sources
+        cd $LFS_SOURCES
         rm -rf xterm-*
         mkdir -p /etc/X11/xorg.conf.d
         echo 'Section \"InputClass\"' > /etc/X11/xorg.conf.d/00-keyboard.conf
@@ -537,12 +550,12 @@ install_x11() {
         chown -R $USERNAME:$USERNAME /home/$USERNAME/.fluxbox
         echo 'startx' >> /home/$USERNAME/.bash_profile
     "
-    message "X11 environment installed successfully."
+    message "$GREEN" "X11 environment installed successfully."
 }
 
 # Function to build final system
 build_final_system() {
-    message "Building final LFS system..."
+    message "$BLUE" "Building final LFS system..."
     chroot "$LFS_MOUNT" /tools/bin/env -i HOME=/root TERM="$TERM" PS1='(lfs chroot) \u:\w\$ ' PATH=/bin:/usr/bin:/sbin:/usr/sbin:/tools/bin /tools/bin/bash --login +h -c "
         set -e
         mkdir -pv /{boot,home,mnt,opt,srv}
@@ -673,11 +686,12 @@ EOF
     if [ "$INSTALL_X11" = "yes" ]; then
         install_x11
     fi
-    message "Final LFS system built successfully."
+    message "$GREEN" "Final LFS system built successfully."
 }
 
 # Main function
 main() {
+    setup_terminal
     check_root
     check_host_tools
     prompt_options
@@ -689,7 +703,7 @@ main() {
     mount_virtual_fs
     build_temporary_tools
     build_final_system
-    message "LFS $LFS_VERSION installation complete! Reboot to start your system."
+    message "$GREEN" "LFS $LFS_VERSION installation complete! Reboot to start your system."
 }
 
 main
