@@ -1,0 +1,695 @@
+#!/bin/sh
+
+# Automated Linux From Scratch (LFS) Installation Script
+# POSIX-compliant, supports UEFI/BIOS, automatic partitioning, and basic BLFS setup
+
+set -e
+
+# Variables
+LFS_VERSION="12.3"
+LFS_MOUNT="/mnt/lfs"
+LFS_SOURCES="$LFS_MOUNT/sources"
+WGET_LIST="https://www.linuxfromscratch.org/lfs/view/stable/wget-list-sysv"
+MD5SUMS="https://www.linuxfromscratch.org/lfs/view/stable/md5sums"
+HOSTNAME="lfs"
+USERNAME=""
+ROOT_PASS=""
+USER_PASS=""
+BOOT_MODE="BIOS"
+LFS_PART=""
+EFI_PART=""
+SWAP_PART=""
+DISK=""
+SWAP_SIZE=2048  # in MB
+MIN_DISK_SIZE=25  # in GB
+USE_MUSL="no"
+USE_BUSYBOX="no"
+INSTALL_X11="no"
+
+# URLs for additional packages
+MUSL_URL="https://musl.libc.org/releases/musl-1.2.5.tar.gz"
+BUSYBOX_URL="https://busybox.net/downloads/busybox-1.36.1.tar.bz2"
+# BLFS X11 dependencies
+XORG_PROTO_URL="https://www.x.org/pub/individual/proto/xorgproto-2024.1.tar.xz"
+LIBXAU_URL="https://www.x.org/pub/individual/lib/libXau-1.0.11.tar.xz"
+LIBXDMCP_URL="https://www.x.org/pub/individual/lib/libXdmcp-1.1.5.tar.xz"
+LIBX11_URL="https://www.x.org/pub/individual/lib/libX11-1.8.10.tar.xz"
+LIBXEXT_URL="https://www.x.org/pub/individual/lib/libXext-1.3.6.tar.xz"
+LIBXRENDER_URL="https://www.x.org/pub/individual/lib/libXrender-0.9.11.tar.xz"
+LIBXCB_URL="https://www.x.org/pub/individual/lib/libxcb-1.17.0.tar.xz"
+XCB_PROTO_URL="https://www.x.org/pub/individual/proto/xcb-proto-1.17.0.tar.xz"
+XORG_SERVER_URL="https://www.x.org/pub/individual/xserver/xorg-server-21.1.16.tar.xz"
+LIBXCVT_URL="https://www.x.org/pub/individual/lib/libxcvt-0.1.3.tar.xz"
+PIXMAN_URL="https://www.cairographics.org/releases/pixman-0.44.2.tar.gz"
+XKEYBOARD_CONFIG_URL="https://www.x.org/pub/individual/data/xkeyboard-config/xkeyboard-config-2.44.tar.xz"
+XINIT_URL="https://www.x.org/pub/individual/app/xinit-1.4.2.tar.xz"
+FLUXBOX_URL="http://downloads.sourceforge.net/fluxbox/fluxbox-1.3.7.tar.xz"
+XTERM_URL="https://invisible-mirror.net/archives/xterm/xterm-392.tgz"
+PATCH_URL="https://www.linuxfromscratch.org/patches/blfs/svn/xorg-server-21.1.16-tearfree_backport-1.patch"
+FONT_UTIL_URL="https://www.x.org/pub/individual/font/font-util-1.4.1.tar.xz"
+
+# Function to display messages
+message() {
+    printf "%s\n" "$1"
+}
+
+# Function to check root privileges
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        message "Error: This script must be run as root!"
+        exit 1
+    fi
+}
+
+# Function to check host tools
+check_host_tools() {
+    for tool in wget parted mkfs.ext4 mkfs.vfat mkswap swapon; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            message "Error: Required tool $tool is missing. Please install it."
+            exit 1
+        fi
+    done
+    message "All required host tools are present."
+}
+
+# Function to prompt user with yes/no
+prompt_yes_no() {
+    message "$1 [y/N]: "
+    read answer
+    case "$answer" in
+        [Yy]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Function to detect UEFI
+check_uefi() {
+    if [ -d /sys/firmware/efi ]; then
+        BOOT_MODE="UEFI"
+        message "Detected UEFI boot mode."
+    else
+        message "Configuring for BIOS boot."
+    fi
+}
+
+# Function to select and partition disk
+partition_disk() {
+    message "Available disks:"
+    disks=$(lsblk -d -o NAME,TYPE | grep disk | awk '{print $1}')
+    if [ -z "$disks" ]; then
+        message "Error: No disks found!"
+        exit 1
+    fi
+    i=1
+    for disk in $disks; do
+        printf "%d) /dev/%s\n" "$i" "$disk"
+        eval "disk_$i=$disk"
+        i=$((i + 1))
+    done
+    message "Select disk number (1-$((i - 1))): "
+    read choice
+    if ! echo "$choice" | grep -q '^[0-9]$' || [ "$choice" -lt 1 ] || [ "$choice" -ge "$i" ]; then
+        message "Error: Invalid selection!"
+        exit 1
+    fi
+    eval "DISK=/dev/\$disk_$choice"
+    message "Selected disk: $DISK"
+
+    message "This will erase all data on $DISK. Proceed? [y/N]: "
+    read confirm
+    case "$confirm" in
+        [Yy]*) ;;
+        *) message "Partitioning canceled."; exit 1 ;;
+    esac
+
+    disk_size=$(blockdev --getsize64 "$DISK")
+    disk_size_gb=$((disk_size / 1024 / 1024 / 1024))
+    if [ "$disk_size_gb" -lt "$MIN_DISK_SIZE" ]; then
+        message "Warning: Disk size ($disk_size_gb GB) is less than $MIN_DISK_SIZE GB."
+        if ! prompt_yes_no "Proceed anyway?"; then
+            exit 1
+        fi
+    fi
+
+    case "$DISK" in
+        *nvme*) PART_SUFFIX="p" ;;
+        *) PART_SUFFIX="" ;;
+    esac
+
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        parted -s "$DISK" mklabel gpt
+        parted -s "$DISK" mkpart ESP fat32 0% 512MiB
+        parted -s "$DISK" set 1 esp on
+        parted -s "$DISK" mkpart primary linux-swap -${SWAP_SIZE}MiB 100%
+        parted -s "$DISK" mkpart primary ext4 512MiB -${SWAP_SIZE}MiB
+        EFI_PART="${DISK}${PART_SUFFIX}1"
+        LFS_PART="${DISK}${PART_SUFFIX}3"
+        SWAP_PART="${DISK}${PART_SUFFIX}2"
+    else
+        parted -s "$DISK" mklabel gpt
+        parted -s "$DISK" mkpart primary 0% 1MiB
+        parted -s "$DISK" set 1 bios_grub on
+        parted -s "$DISK" mkpart primary linux-swap -${SWAP_SIZE}MiB 100%
+        parted -s "$DISK" mkpart primary ext4 1MiB -${SWAP_SIZE}MiB
+        LFS_PART="${DISK}${PART_SUFFIX}3"
+        SWAP_PART="${DISK}${PART_SUFFIX}2"
+    fi
+
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        mkfs.vfat -F32 "$EFI_PART"
+    fi
+    mkfs.ext4 "$LFS_PART"
+    mkswap "$SWAP_PART"
+
+    mkdir -p "$LFS_MOUNT"
+    mount "$LFS_PART" "$LFS_MOUNT"
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        mkdir -p "$LFS_MOUNT/boot/efi"
+        mount "$EFI_PART" "$LFS_MOUNT/boot/efi"
+    fi
+    swapon "$SWAP_PART"
+    message "Partitioning and mounting completed."
+}
+
+# Function to prompt user options
+prompt_options() {
+    message "Enter hostname (default: lfs): "
+    read hostname_input
+    HOSTNAME="${hostname_input:-lfs}"
+
+    message "Enter username for LFS user: "
+    read USERNAME
+    while [ -z "$USERNAME" ]; do
+        message "Error: Username cannot be empty!"
+        message "Enter username for LFS user: "
+        read USERNAME
+    done
+
+    message "Enter root password: "
+    read -r ROOT_PASS
+    while [ -z "$ROOT_PASS" ]; do
+        message "Error: Root password cannot be empty!"
+        message "Enter root password: "
+        read -r ROOT_PASS
+    done
+
+    message "Enter password for user $USERNAME: "
+    read -r USER_PASS
+    while [ -z "$USER_PASS" ]; do
+        message "Error: User password cannot be empty!"
+        message "Enter password for user $USERNAME: "
+        read -r USER_PASS
+    done
+
+    message "Select libc implementation:"
+    message "1) glibc"
+    message "2) musl"
+    message "Enter choice [1]: "
+    read libc_choice
+    case "$libc_choice" in
+        2) USE_MUSL="yes" ;;
+        ""|1|*) USE_MUSL="no" ;;
+    esac
+
+    message "Select utilities:"
+    message "1) coreutils"
+    message "2) busybox"
+    message "Enter choice [1]: "
+    read utils_choice
+    case "$utils_choice" in
+        2) USE_BUSYBOX="yes" ;;
+        ""|1|*) USE_BUSYBOX="no" ;;
+    esac
+
+    message "Install basic X11 environment with fluxbox and xterm? [y/N]: "
+    read x11_choice
+    case "$x11_choice" in
+        [Yy]*) INSTALL_X11="yes" ;;
+        *) INSTALL_X11="no" ;;
+    esac
+}
+
+# Function to download packages
+download_packages() {
+    message "Downloading LFS and BLFS packages..."
+    mkdir -p "$LFS_SOURCES"
+    chmod a+wt "$LFS_SOURCES"
+    wget -i "$WGET_LIST" -P "$LFS_SOURCES" || message "Warning: Some LFS downloads may have failed."
+    if [ "$USE_MUSL" = "yes" ]; then
+        wget -P "$LFS_SOURCES" "$MUSL_URL" || message "Warning: Failed to download musl."
+    fi
+    if [ "$USE_BUSYBOX" = "yes" ]; then
+        wget -P "$LFS_SOURCES" "$BUSYBOX_URL" || message "Warning: Failed to download busybox."
+    fi
+    if [ "$INSTALL_X11" = "yes" ]; then
+        for url in "$XORG_PROTO_URL" "$LIBXAU_URL" "$LIBXDMCP_URL" "$LIBX11_URL" "$LIBXEXT_URL" "$LIBXRENDER_URL" "$LIBXCB_URL" "$XCB_PROTO_URL" "$XORG_SERVER_URL" "$LIBXCVT_URL" "$PIXMAN_URL" "$XKEYBOARD_CONFIG_URL" "$XINIT_URL" "$FLUXBOX_URL" "$XTERM_URL" "$PATCH_URL" "$FONT_UTIL_URL"; do
+            wget -P "$LFS_SOURCES" "$url" || message "Warning: Failed to download $url."
+        done
+    fi
+    pushd "$LFS_SOURCES"
+    wget -q -O md5sums "$MD5SUMS"
+    md5sum -c md5sums || message "Warning: Some packages may not match MD5 sums."
+    popd
+    message "Package downloads completed."
+}
+
+# Function to setup LFS environment
+setup_lfs_environment() {
+    message "Setting up LFS environment..."
+    mkdir -pv "$LFS_MOUNT"/{etc,var,usr/{bin,lib,sbin},tools}
+    for i in bin lib sbin; do ln -sv usr/$i "$LFS_MOUNT/$i"; done
+    [ "$(uname -m)" = "x86_64" ] && mkdir -pv "$LFS_MOUNT/lib64"
+    groupadd lfs || true
+    useradd -s /bin/bash -g lfs -m -k /dev/null lfs || true
+    echo "lfs:$USER_PASS" | chpasswd
+    cat > /home/lfs/.bash_profile << "EOF"
+exec env -i HOME=$HOME TERM=$TERM PS1='\u:\w\$ ' /bin/bash
+EOF
+    cat > /home/lfs/.bashrc << "EOF"
+set +h
+umask 022
+LFS=/mnt/lfs
+LC_ALL=POSIX
+LFS_TGT=$(uname -m)-lfs-linux-gnu
+PATH=/usr/bin:/bin:$LFS/tools/bin
+CONFIG_SITE=$LFS/usr/share/config.site
+export LFS LC_ALL LFS_TGT PATH CONFIG_SITE
+EOF
+    chown lfs:lfs /home/lfs/{.bash_profile,.bashrc}
+    chown -v lfs "$LFS_MOUNT"/{tools,sources}
+    message "LFS environment setup completed."
+}
+
+# Function to build temporary toolchain
+build_toolchain() {
+    message "Building temporary toolchain..."
+    su - lfs -c "
+        set -e
+        cd $LFS_SOURCES
+        tar -xf binutils-*.tar.*
+        cd binutils-*
+        mkdir build && cd build
+        ../configure --prefix=/tools --with-sysroot=$LFS_MOUNT --target=$LFS_TGT --disable-nls
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf binutils-*
+        tar -xf gcc-*.tar.*
+        cd gcc-*
+        tar -xf ../mpfr-*.tar.* && mv mpfr-* mpfr
+        tar -xf ../gmp-*.tar.* && mv gmp-* gmp
+        tar -xf ../mpc-*.tar.* && mv mpc-* mpc
+        mkdir build && cd build
+        ../configure --target=$LFS_TGT --prefix=/tools --with-sysroot=$LFS_MOUNT --without-headers --enable-languages=c,c++
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf gcc-*
+        tar -xf linux-*.tar.*
+        cd linux-*
+        make headers
+        cp -rv usr/include/* /tools/include
+        cd $LFS_SOURCES
+        rm -rf linux-*
+        if [ \"$USE_MUSL\" = \"yes\" ]; then
+            tar -xf musl-*.tar.*
+            cd musl-*
+            ./configure --prefix=/tools --host=$LFS_TGT --enable-shared
+            make
+            make install
+            cd $LFS_SOURCES
+            rm -rf musl-*
+        else
+            tar -xf glibc-*.tar.*
+            cd glibc-*
+            mkdir build && cd build
+            ../configure --prefix=/tools --host=$LFS_TGT --with-headers=/tools/include
+            make
+            make install
+            cd $LFS_SOURCES
+            rm -rf glibc-*
+        fi
+        tar -xf gcc-*.tar.*
+        cd gcc-*
+        mkdir build && cd build
+        ../libstdc++-v3/configure --host=$LFS_TGT --prefix=/tools --disable-multilib
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf gcc-*
+    "
+    message "Temporary toolchain built successfully."
+}
+
+# Function to mount virtual filesystems
+mount_virtual_fs() {
+    message "Mounting virtual filesystems..."
+    mkdir -pv "$LFS_MOUNT"/{dev,proc,sys,run}
+    mount -v --bind /dev "$LFS_MOUNT/dev"
+    mount -v --bind /dev/pts "$LFS_MOUNT/dev/pts"
+    mount -vt proc proc "$LFS_MOUNT/proc"
+    mount -vt sysfs sysfs "$LFS_MOUNT/sys"
+    mount -vt tmpfs tmpfs "$LFS_MOUNT/run"
+    message "Virtual filesystems mounted."
+}
+
+# Function to build temporary tools
+build_temporary_tools() {
+    message "Building temporary tools..."
+    su - lfs -c "
+        set -e
+        cd $LFS_SOURCES
+        tar -xf bash-*.tar.*
+        cd bash-*
+        ./configure --prefix=/tools --host=$LFS_TGT
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf bash-*
+        if [ \"$USE_BUSYBOX\" = \"yes\" ]; then
+            tar -xf busybox-*.tar.*
+            cd busybox-*
+            make defconfig
+            make
+            make CONFIG_PREFIX=/tools install
+            cd $LFS_SOURCES
+            rm -rf busybox-*
+        else
+            tar -xf coreutils-*.tar.*
+            cd coreutils-*
+            ./configure --prefix=/tools --host=$LFS_TGT
+            make
+            make install
+            cd $LFS_SOURCES
+            rm -rf coreutils-*
+        fi
+        # Additional tools for a complete toolchain
+        tar -xf m4-*.tar.*
+        cd m4-*
+        ./configure --prefix=/tools --host=$LFS_TGT
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf m4-*
+        tar -xf ncurses-*.tar.*
+        cd ncurses-*
+        ./configure --prefix=/tools --host=$LFS_TGT --with-shared --without-debug --without-ada
+        make
+        make install
+        cd $LFS_SOURCES
+        rm -rf ncurses-*
+    "
+    message "Temporary tools built successfully."
+}
+
+# Function to install X11 environment (BLFS)
+install_x11() {
+    message "Installing basic X11 environment..."
+    chroot "$LFS_MOUNT" /tools/bin/env -i HOME=/root TERM="$TERM" PS1='(lfs chroot) \u:\w\$ ' PATH=/bin:/usr/bin:/sbin:/usr/sbin:/tools/bin /tools/bin/bash --login +h -c "
+        set -e
+        cd /sources
+        tar -xf xorgproto-*.tar.*
+        cd xorgproto-*
+        mkdir build && cd build
+        meson setup .. --prefix=/usr
+        ninja
+        ninja install
+        cd /sources
+        rm -rf xorgproto-*
+        tar -xf libXau-*.tar.*
+        cd libXau-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libXau-*
+        tar -xf libXdmcp-*.tar.*
+        cd libXdmcp-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libXdmcp-*
+        tar -xf xcb-proto-*.tar.*
+        cd xcb-proto-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf xcb-proto-*
+        tar -xf libxcb-*.tar.*
+        cd libxcb-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libxcb-*
+        tar -xf libX11-*.tar.*
+        cd libX11-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libX11-*
+        tar -xf libXext-*.tar.*
+        cd libXext-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libXext-*
+        tar -xf libXrender-*.tar.*
+        cd libXrender-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libXrender-*
+        tar -xf libxcvt-*.tar.*
+        cd libxcvt-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf libxcvt-*
+        tar -xf pixman-*.tar.*
+        cd pixman-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf pixman-*
+        tar -xf font-util-*.tar.*
+        cd font-util-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf font-util-*
+        tar -xf xkeyboard-config-*.tar.*
+        cd xkeyboard-config-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf xkeyboard-config-*
+        tar -xf xorg-server-*.tar.*
+        cd xorg-server-*
+        patch -Np1 -i ../xorg-server-21.1.16-tearfree_backport-1.patch
+        mkdir build && cd build
+        meson setup .. --prefix=/usr --localstatedir=/var -D glamor=true -D systemd_logind=false
+        ninja
+        ninja install
+        cd /sources
+        rm -rf xorg-server-*
+        tar -xf xinit-*.tar.*
+        cd xinit-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf xinit-*
+        tar -xf fluxbox-*.tar.*
+        cd fluxbox-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf fluxbox-*
+        tar -xf xterm-*.tar.*
+        cd xterm-*
+        ./configure --prefix=/usr
+        make
+        make install
+        cd /sources
+        rm -rf xterm-*
+        mkdir -p /etc/X11/xorg.conf.d
+        echo 'Section \"InputClass\"' > /etc/X11/xorg.conf.d/00-keyboard.conf
+        echo '    Identifier \"system-keyboard\"' >> /etc/X11/xorg.conf.d/00-keyboard.conf
+        echo '    MatchIsKeyboard \"on\"' >> /etc/X11/xorg.conf.d/00-keyboard.conf
+        echo '    Option \"XkbLayout\" \"us\"' >> /etc/X11/xorg.conf.d/00-keyboard.conf
+        echo 'EndSection' >> /etc/X11/xorg.conf.d/00-keyboard.conf
+        mkdir -p /home/$USERNAME/.fluxbox
+        echo '#!/bin/sh' > /home/$USERNAME/.fluxbox/startup
+        echo 'xterm &' >> /home/$USERNAME/.fluxbox/startup
+        echo 'exec fluxbox' >> /home/$USERNAME/.fluxbox/startup
+        chmod +x /home/$USERNAME/.fluxbox/startup
+        chown -R $USERNAME:$USERNAME /home/$USERNAME/.fluxbox
+        echo 'startx' >> /home/$USERNAME/.bash_profile
+    "
+    message "X11 environment installed successfully."
+}
+
+# Function to build final system
+build_final_system() {
+    message "Building final LFS system..."
+    chroot "$LFS_MOUNT" /tools/bin/env -i HOME=/root TERM="$TERM" PS1='(lfs chroot) \u:\w\$ ' PATH=/bin:/usr/bin:/sbin:/usr/sbin:/tools/bin /tools/bin/bash --login +h -c "
+        set -e
+        mkdir -pv /{boot,home,mnt,opt,srv}
+        mkdir -pv /etc/{opt,sysconfig}
+        mkdir -pv /lib/firmware
+        mkdir -pv /media/{floppy,cdrom}
+        mkdir -pv /usr/{,local/}{bin,include,lib,sbin,src}
+        mkdir -pv /usr/{,local/}share/{color,dict,doc,info,locale,man}
+        mkdir -pv /usr/{,local/}share/man/man{1..8}
+        mkdir -pv /var/{cache,local,log,mail,opt,spool}
+        mkdir -pv /var/lib/{color,misc,locate}
+        ln -sfv /run /var/run
+        ln -sfv /run/lock /var/lock
+        install -dv -m 0750 /root
+        install -dv -m 1777 /tmp /var/tmp
+        ln -sv /proc/self/mounts /etc/mtab
+        echo \"$HOSTNAME\" > /etc/hostname
+        cat > /etc/hosts << EOF
+127.0.0.1 localhost $HOSTNAME
+::1       localhost
+EOF
+        cat > /etc/passwd << EOF
+root:x:0:0:root:/root:/bin/bash
+bin:x:1:1:bin:/dev/null:/bin/false
+nobody:x:65534:65534:Nobody:/:/bin/false
+$USERNAME:x:1000:1000::$HOME:/bin/bash
+EOF
+        cat > /etc/group << EOF
+root:x:0:
+bin:x:1:
+sys:x:2:
+kmem:x:3:
+tty:x:4:
+daemon:x:6:
+disk:x:8:
+nobody:x:65534:
+users:x:1000:
+$USERNAME:x:1000:
+EOF
+        install -o $USERNAME -d /home/$USERNAME
+        echo \"root:$ROOT_PASS\" | chpasswd
+        echo \"$USERNAME:$USER_PASS\" | chpasswd
+        touch /var/log/{btmp,lastlog,faillog,wtmp}
+        chgrp -v 4 /var/log/lastlog
+        chmod -v 664 /var/log/lastlog
+        chmod -v 600 /var/log/btmp
+        cd /sources
+        if [ \"$USE_MUSL\" = \"yes\" ]; then
+            tar -xf musl-*.tar.*
+            cd musl-*
+            ./configure --prefix=/usr --host=$LFS_TGT
+            make
+            make install
+            cd /sources
+            rm -rf musl-*
+        else
+            tar -xf glibc-*.tar.*
+            cd glibc-*
+            mkdir build && cd build
+            ../configure --prefix=/usr --host=$LFS_TGT --with-headers=/tools/include
+            make
+            make install
+            cd /sources
+            rm -rf glibc-*
+        fi
+        if [ \"$USE_BUSYBOX\" = \"yes\" ]; then
+            tar -xf busybox-*.tar.*
+            cd busybox-*
+            make defconfig
+            make
+            make install
+            cd /sources
+            rm -rf busybox-*
+        else
+            tar -xf coreutils-*.tar.*
+            cd coreutils-*
+            ./configure --prefix=/usr
+            make
+            make install
+            cd /sources
+            rm -rf coreutils-*
+        fi
+        tar -xf linux-*.tar.*
+        cd linux-*
+        make defconfig
+        make
+        make modules_install
+        cp -v arch/x86/boot/bzImage /boot/vmlinuz-$LFS_VERSION-lfs
+        cp -v System.map /boot/System.map-$LFS_VERSION
+        cp -v .config /boot/config-$LFS_VERSION
+        cd /sources
+        rm -rf linux-*
+        tar -xf grub-*.tar.*
+        cd grub-*
+        if [ \"$BOOT_MODE\" = \"UEFI\" ]; then
+            ./configure --prefix=/usr --target=x86_64-efi --with-platform=efi
+            make
+            make install
+            grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=LFS
+        else
+            ./configure --prefix=/usr
+            make
+            make install
+            grub-install $DISK
+        fi
+        cat > /boot/grub/grub.cfg << EOF
+set timeout=5
+menuentry \"Linux From Scratch $LFS_VERSION\" {
+    linux /boot/vmlinuz-$LFS_VERSION-lfs root=/dev/$LFS_PART ro
+}
+EOF
+        cd /sources
+        rm -rf grub-*
+        cat > /etc/fstab << EOF
+# Begin /etc/fstab
+/dev/$LFS_PART / ext4 defaults 1 1
+/dev/$SWAP_PART none swap sw 0 0
+EOF
+        if [ \"$BOOT_MODE\" = \"UEFI\" ]; then
+            echo \"/dev/$EFI_PART /boot/efi vfat defaults 0 2\" >> /etc/fstab
+        fi
+        if [ \"$INSTALL_X11\" = \"yes\" ]; then
+            echo \"proc /proc proc defaults 0 0\" >> /etc/fstab
+            echo \"sysfs /sys sysfs defaults 0 0\" >> /etc/fstab
+            echo \"devtmpfs /dev devtmpfs mode=0755,nosuid 0 0\" >> /etc/fstab
+        fi
+    "
+    if [ "$INSTALL_X11" = "yes" ]; then
+        install_x11
+    fi
+    message "Final LFS system built successfully."
+}
+
+# Main function
+main() {
+    check_root
+    check_host_tools
+    prompt_options
+    check_uefi
+    partition_disk
+    download_packages
+    setup_lfs_environment
+    build_toolchain
+    mount_virtual_fs
+    build_temporary_tools
+    build_final_system
+    message "LFS $LFS_VERSION installation complete! Reboot to start your system."
+}
+
+main
